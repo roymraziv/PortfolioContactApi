@@ -45,7 +45,7 @@ public class Function
     private Dictionary<string, string> ParseClientEmails(string mappings)
     {
         var result = new Dictionary<string, string>();
-        if (!string.IsNullOrWhiteSpace(mappings)) return result;
+        if (string.IsNullOrWhiteSpace(mappings)) return result;
         
         var pairs = mappings.Split(',', StringSplitOptions.RemoveEmptyEntries);
         foreach (var pair in pairs)
