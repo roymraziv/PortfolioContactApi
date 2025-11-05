@@ -21,28 +21,30 @@ public class Function
     public Function()
     {
         _sesClient = new AmazonSimpleEmailServiceClient();
-        _apiKey = Environment.GetEnvironmentVariable("API_KEY");
-        _verifiedSender = Environment.GetEnvironmentVariable("VERIFIED_SENDER_EMAIL");
+        _apiKey = Environment.GetEnvironmentVariable("API_KEY") ?? "";
+        _verifiedSender = Environment.GetEnvironmentVariable("VERIFIED_SENDER_EMAIL") ?? "";
         var clientMappings = Environment.GetEnvironmentVariable("CLIENT_EMAIL_MAPPINGS");
         _clientEmails = ParseClientEmails(clientMappings);
-        var allowedOrigins = Environment.GetEnvironmentVariable("ALLOWED_ORIGINS");
+        var allowedOrigins = Environment.GetEnvironmentVariable("ALLOWED_ORIGINS") ?? "";
         _allowedOrigins = allowedOrigins.Split(',', StringSplitOptions.RemoveEmptyEntries)
             .Select(o => o.Trim()).ToHashSet();
+        
+        Console.WriteLine($"Function initialized - API Key set: {!string.IsNullOrEmpty(_apiKey)}, Verified Sender: {_verifiedSender}, Client Emails count: {_clientEmails.Count}, Allowed Origins count: {_allowedOrigins.Count}");
     }
 
     public Function(IAmazonSimpleEmailService sesClient)
     {
         _sesClient = sesClient;
-        _apiKey = Environment.GetEnvironmentVariable("API_KEY");
-        _verifiedSender = Environment.GetEnvironmentVariable("VERIFIED_SENDER_EMAIL");
+        _apiKey = Environment.GetEnvironmentVariable("API_KEY") ?? "";
+        _verifiedSender = Environment.GetEnvironmentVariable("VERIFIED_SENDER_EMAIL") ?? "";
         var clientMappings = Environment.GetEnvironmentVariable("CLIENT_EMAIL_MAPPINGS");
         _clientEmails = ParseClientEmails(clientMappings);
-        var allowedOrigins = Environment.GetEnvironmentVariable("ALLOWED_ORIGINS");
+        var allowedOrigins = Environment.GetEnvironmentVariable("ALLOWED_ORIGINS") ?? "";
         _allowedOrigins = allowedOrigins.Split(',', StringSplitOptions.RemoveEmptyEntries)
             .Select(o => o.Trim()).ToHashSet();
     }
 
-    private Dictionary<string, string> ParseClientEmails(string mappings)
+    private Dictionary<string, string> ParseClientEmails(string? mappings)
     {
         var result = new Dictionary<string, string>();
         if (string.IsNullOrWhiteSpace(mappings)) return result;
@@ -52,19 +54,47 @@ public class Function
         {
             var parts = pair.Split(':');
             if (parts.Length != 2) continue;
-            result.Add(parts[0], parts[1]);
+            result.Add(parts[0].Trim(), parts[1].Trim());
         }
         return result;
     }
     
     public async Task<APIGatewayProxyResponse> FunctionHandler(APIGatewayProxyRequest request, ILambdaContext context)
     {
+        context.Logger.LogInformation("=== Function invoked ===");
+        
+        // Add null checks with logging
+        if (request == null)
+        {
+            context.Logger.LogError("Request is null");
+            return CreateResponse(400, new { error = "Invalid request" }, new Dictionary<string, string>
+            {
+                { "Content-Type", "application/json" }
+            });
+        }
+        
+        context.Logger.LogInformation($"HTTP Method: {request.HttpMethod ?? "null"}");
+        
+        if (request.Headers == null)
+        {
+            context.Logger.LogError("Request.Headers is null");
+            return CreateResponse(400, new { error = "Invalid request headers" }, new Dictionary<string, string>
+            {
+                { "Content-Type", "application/json" }
+            });
+        }
+        
+        context.Logger.LogInformation($"Headers count: {request.Headers.Count}");
+        context.Logger.LogInformation($"Headers: {string.Join(", ", request.Headers.Keys)}");
+        
         // Get origin for CORS
         var origin = request.Headers.ContainsKey("origin") 
             ? request.Headers["origin"] 
             : request.Headers.ContainsKey("Origin") 
                 ? request.Headers["Origin"] 
                 : "";
+        
+        context.Logger.LogInformation($"Origin: {origin}");
 
         // Base CORS headers
         var headers = new Dictionary<string, string>
@@ -85,28 +115,44 @@ public class Function
         }
 
         // Handle OPTIONS preflight request
-        if (request.HttpMethod.Equals("OPTIONS", StringComparison.OrdinalIgnoreCase))
+        if (request.HttpMethod?.Equals("OPTIONS", StringComparison.OrdinalIgnoreCase) == true)
         {
+            context.Logger.LogInformation("Handling OPTIONS preflight request");
             return CreateResponse(200, new { message = "OK" }, headers);
         }
 
         try
         {
+            context.Logger.LogInformation("Starting request validation");
+            
             // Validate API key
+            context.Logger.LogInformation("Validating API key");
             if (!ValidateApiKey(request.Headers))
             {
                 context.Logger.LogWarning("Invalid API key attempt");
                 return CreateResponse(403, new { error = "Forbidden: Invalid API key" }, headers);
             }
+            context.Logger.LogInformation("API key validated successfully");
 
             // Validate origin
+            context.Logger.LogInformation($"Validating origin: {origin}");
             if (!IsOriginAllowed(origin))
             {
                 context.Logger.LogWarning($"Request from unauthorized origin: {origin}");
                 return CreateResponse(403, new { error = "Forbidden: Unauthorized origin" }, headers);
             }
+            context.Logger.LogInformation("Origin validated successfully");
 
             // Parse request body
+            context.Logger.LogInformation($"Request body length: {request.Body?.Length ?? 0}");
+            context.Logger.LogInformation($"Request body: {request.Body ?? "null"}");
+            
+            if (string.IsNullOrEmpty(request.Body))
+            {
+                context.Logger.LogError("Request body is null or empty");
+                return CreateResponse(400, new { error = "Request body is required" }, headers);
+            }
+            
             var body = JsonSerializer.Deserialize<ContactRequest>(request.Body, new JsonSerializerOptions 
             { 
                 PropertyNameCaseInsensitive = true 
@@ -114,24 +160,36 @@ public class Function
 
             if (body == null)
             {
+                context.Logger.LogError("Failed to deserialize request body");
                 return CreateResponse(400, new { error = "Invalid request body" }, headers);
             }
+            
+            context.Logger.LogInformation($"Request parsed - ClientId: {body.ClientId}, Name: {body.Name}, Email: {body.Email}");
 
             // Validate required fields
             var validationError = ValidateContactRequest(body);
             if (validationError != null)
             {
+                context.Logger.LogWarning($"Validation failed: {validationError}");
                 return CreateResponse(400, new { error = validationError }, headers);
             }
+            
+            context.Logger.LogInformation("Request validation passed");
 
             // Get recipient email from client ID
+            context.Logger.LogInformation($"Looking up recipient email for ClientId: {body.ClientId}");
+            context.Logger.LogInformation($"Available client IDs: {string.Join(", ", _clientEmails.Keys)}");
+            
             if (!_clientEmails.TryGetValue(body.ClientId, out var recipientEmail))
             {
                 context.Logger.LogWarning($"Unknown client ID: {body.ClientId}");
                 return CreateResponse(400, new { error = "Invalid client ID" }, headers);
             }
+            
+            context.Logger.LogInformation($"Recipient email found: {recipientEmail}");
 
             // Send email
+            context.Logger.LogInformation("Attempting to send email via SES");
             var messageId = await SendEmailAsync(body, recipientEmail, context);
 
             context.Logger.LogInformation($"Email sent successfully. MessageId: {messageId}");
