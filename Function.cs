@@ -103,7 +103,7 @@ public class Function
         {
             { "Content-Type", "application/json" },
             { "Access-Control-Allow-Methods", "POST, OPTIONS" },
-            { "Access-Control-Allow-Headers", "Content-Type, x-api-key" }
+            { "Access-Control-Allow-Headers", "Content-Type, x-api-key, x-form-type" }
         };
 
         // Validate and set CORS origin
