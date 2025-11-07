@@ -4,6 +4,8 @@ using Amazon.Lambda.APIGatewayEvents;
 using Amazon.Lambda.Core;
 using Amazon.SimpleEmail;
 using Amazon.SimpleEmail.Model;
+using PortfolioContactApi.Models;
+using PortfolioContactApi.Services;
 
 // Assembly attribute to enable the Lambda function's JSON input to be converted into a .NET class.
 [assembly: LambdaSerializer(typeof(Amazon.Lambda.Serialization.SystemTextJson.DefaultLambdaJsonSerializer))]
@@ -13,14 +15,26 @@ namespace PortfolioContactApi;
 public class Function
 {
     private readonly IAmazonSimpleEmailService _sesClient;
+    private readonly IFormDeserializer _formDeserializer;
+    private readonly IEmailFormatter _emailFormatter;
     private readonly Dictionary<string, string> _clientEmails;
     private readonly HashSet<string> _allowedOrigins;
     private readonly string _apiKey;
     private readonly string _verifiedSender;
 
     public Function()
+        : this(new AmazonSimpleEmailServiceClient(), new FormDeserializer(), new EmailFormatter())
     {
-        _sesClient = new AmazonSimpleEmailServiceClient();
+    }
+
+    public Function(
+        IAmazonSimpleEmailService sesClient,
+        IFormDeserializer formDeserializer,
+        IEmailFormatter emailFormatter)
+    {
+        _sesClient = sesClient;
+        _formDeserializer = formDeserializer;
+        _emailFormatter = emailFormatter;
         _apiKey = Environment.GetEnvironmentVariable("API_KEY") ?? "";
         _verifiedSender = Environment.GetEnvironmentVariable("VERIFIED_SENDER_EMAIL") ?? "";
         var clientMappings = Environment.GetEnvironmentVariable("CLIENT_EMAIL_MAPPINGS");
@@ -30,18 +44,6 @@ public class Function
             .Select(o => o.Trim()).ToHashSet();
         
         Console.WriteLine($"Function initialized - API Key set: {!string.IsNullOrEmpty(_apiKey)}, Verified Sender: {_verifiedSender}, Client Emails count: {_clientEmails.Count}, Allowed Origins count: {_allowedOrigins.Count}");
-    }
-
-    public Function(IAmazonSimpleEmailService sesClient)
-    {
-        _sesClient = sesClient;
-        _apiKey = Environment.GetEnvironmentVariable("API_KEY") ?? "";
-        _verifiedSender = Environment.GetEnvironmentVariable("VERIFIED_SENDER_EMAIL") ?? "";
-        var clientMappings = Environment.GetEnvironmentVariable("CLIENT_EMAIL_MAPPINGS");
-        _clientEmails = ParseClientEmails(clientMappings);
-        var allowedOrigins = Environment.GetEnvironmentVariable("ALLOWED_ORIGINS") ?? "";
-        _allowedOrigins = allowedOrigins.Split(',', StringSplitOptions.RemoveEmptyEntries)
-            .Select(o => o.Trim()).ToHashSet();
     }
 
     private Dictionary<string, string> ParseClientEmails(string? mappings)
@@ -153,40 +155,38 @@ public class Function
                 return CreateResponse(400, new { error = "Request body is required" }, headers);
             }
             
-            var body = JsonSerializer.Deserialize<ContactRequest>(request.Body, new JsonSerializerOptions 
-            { 
-                PropertyNameCaseInsensitive = true 
-            });
+            // Get form type from header or default to "contact"
+            var formType = request.Headers.ContainsKey("x-form-type") 
+                ? request.Headers["x-form-type"] 
+                : "contact";
+            
+            context.Logger.LogInformation($"Form type: {formType}");
+
+            // Deserialize using the appropriate type
+            var body = _formDeserializer.Deserialize(request.Body, formType);
 
             if (body == null)
             {
                 context.Logger.LogError("Failed to deserialize request body");
-                return CreateResponse(400, new { error = "Invalid request body" }, headers);
+                return CreateResponse(400, new { error = "Invalid request body or form type" }, headers);
             }
             
-            context.Logger.LogInformation($"Request parsed - ClientId: {body.ClientId}, Name: {body.Name}, Email: {body.Email}");
+            context.Logger.LogInformation($"Request parsed - ClientId: {body.ClientId}, FormType: {body.GetFormType()}");
 
-            // Validate required fields
-            var validationError = ValidateContactRequest(body);
+            // Validate (you can create IFormValidator for this too)
+            var validationError = ValidateFormRequest(body);
             if (validationError != null)
             {
                 context.Logger.LogWarning($"Validation failed: {validationError}");
                 return CreateResponse(400, new { error = validationError }, headers);
             }
-            
-            context.Logger.LogInformation("Request validation passed");
 
-            // Get recipient email from client ID
-            context.Logger.LogInformation($"Looking up recipient email for ClientId: {body.ClientId}");
-            context.Logger.LogInformation($"Available client IDs: {string.Join(", ", _clientEmails.Keys)}");
-            
+            // Get recipient email
             if (!_clientEmails.TryGetValue(body.ClientId, out var recipientEmail))
             {
                 context.Logger.LogWarning($"Unknown client ID: {body.ClientId}");
                 return CreateResponse(400, new { error = "Invalid client ID" }, headers);
             }
-            
-            context.Logger.LogInformation($"Recipient email found: {recipientEmail}");
 
             // Send email
             context.Logger.LogInformation("Attempting to send email via SES");
@@ -208,7 +208,7 @@ public class Function
             return CreateResponse(500, new { error = "Internal server error" }, headers);
         }
     }
-    
+
     private APIGatewayProxyResponse CreateResponse(int statusCode, object body, Dictionary<string, string> headers)
     {
         return new APIGatewayProxyResponse
@@ -241,82 +241,30 @@ public class Function
         return _allowedOrigins.Any(allowed => origin.Contains(allowed, StringComparison.OrdinalIgnoreCase));
     }
     
-    private string? ValidateContactRequest(ContactRequest request)
+    private string? ValidateFormRequest(IFormRequest request)
     {
         if (string.IsNullOrWhiteSpace(request.ClientId))
             return "Client ID is required";
 
-        if (string.IsNullOrWhiteSpace(request.Name))
-            return "Name is required";
-
-        if (string.IsNullOrWhiteSpace(request.Email))
-            return "Email is required";
-
-        if (string.IsNullOrWhiteSpace(request.Message))
-            return "Message is required";
-
-        // Validate email format
-        var emailRegex = new Regex(@"^[^@\s]+@[^@\s]+\.[^@\s]+$");
-        if (!emailRegex.IsMatch(request.Email))
-            return "Invalid email format";
-
-        // Length validations
-        if (request.Name.Length > 100)
-            return "Name is too long (max 100 characters)";
-
-        if (request.Email.Length > 100)
-            return "Email is too long (max 100 characters)";
-
-        if (request.Message.Length > 5000)
-            return "Message is too long (max 5000 characters)";
+        var formData = request.GetFormData();
+        
+        // Check required fields
+        foreach (var (key, value) in formData)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+                return $"{key} is required";
+        }
 
         return null;
     }
-    
-    private async Task<string> SendEmailAsync(ContactRequest request, string recipientEmail, ILambdaContext context)
+
+    private async Task<string> SendEmailAsync(IFormRequest request, string recipientEmail, ILambdaContext context)
     {
-        var timestamp = DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss UTC");
-        var subject = "You've received a form submission!";
-        var textBody = $@"New contact form submission from {request.ClientId}
-
-Name: {request.Name}
-Email: {request.Email}
-
-Message:
-{request.Message}
-
----
-Sent: {timestamp}
-Client: {request.ClientId}";
-
-        var htmlBody = $@"
-<html>
-<head></head>
-<body style='font-family: Arial, sans-serif; line-height: 1.6; color: #333;'>
-    <div style='max-width: 600px; margin: 0 auto; padding: 20px;'>
-        <h2 style='color: #2c3e50; border-bottom: 2px solid #3498db; padding-bottom: 10px;'>
-            New Contact Form Submission
-        </h2>
+        var (subject, textBody, htmlBody) = _emailFormatter.FormatEmail(request);
         
-        <div style='background-color: #f8f9fa; padding: 15px; border-radius: 5px; margin: 20px 0;'>
-            <p style='margin: 5px 0;'><strong>Name:</strong> {System.Web.HttpUtility.HtmlEncode(request.Name)}</p>
-            <p style='margin: 5px 0;'><strong>Email:</strong> <a href='mailto:{request.Email}'>{System.Web.HttpUtility.HtmlEncode(request.Email)}</a></p>
-        </div>
-        
-        <div style='background-color: #fff; padding: 15px; border-left: 4px solid #3498db; margin: 20px 0;'>
-            <p style='margin: 0 0 10px 0;'><strong>Message:</strong></p>
-            <p style='white-space: pre-wrap; margin: 0;'>{System.Web.HttpUtility.HtmlEncode(request.Message)}</p>
-        </div>
-        
-        <hr style='border: none; border-top: 1px solid #ddd; margin: 20px 0;'>
-        
-        <p style='color: #7f8c8d; font-size: 12px; margin: 5px 0;'>
-            Sent: {timestamp}<br>
-            Client: {request.ClientId}
-        </p>
-    </div>
-</body>
-</html>";
+        var emailAddress = request.GetFormData()
+            .FirstOrDefault(x => x.Key.Contains("Email", StringComparison.OrdinalIgnoreCase))
+            .Value ?? "";
 
         var sendRequest = new SendEmailRequest
         {
@@ -334,7 +282,9 @@ Client: {request.ClientId}";
                     Html = new Content(htmlBody)
                 }
             },
-            ReplyToAddresses = new List<string> { request.Email }
+            ReplyToAddresses = !string.IsNullOrEmpty(emailAddress) 
+                ? new List<string> { emailAddress } 
+                : null
         };
 
         var response = await _sesClient.SendEmailAsync(sendRequest);
