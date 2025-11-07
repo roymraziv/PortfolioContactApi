@@ -17,24 +17,34 @@ public class Function
     private readonly IAmazonSimpleEmailService _sesClient;
     private readonly IFormDeserializer _formDeserializer;
     private readonly IEmailFormatter _emailFormatter;
+    private readonly RateLimiter _rateLimiter;
     private readonly Dictionary<string, string> _clientEmails;
     private readonly HashSet<string> _allowedOrigins;
     private readonly string _apiKey;
     private readonly string _verifiedSender;
 
     public Function()
-        : this(new AmazonSimpleEmailServiceClient(), new FormDeserializer(), new EmailFormatter())
+        : this(
+            new AmazonSimpleEmailServiceClient(),
+            new FormDeserializer(),
+            new EmailFormatter(),
+            new RateLimiter(
+                Environment.GetEnvironmentVariable("RATE_LIMIT_TABLE") ?? "",
+                maxRequestsPerHour: int.Parse(Environment.GetEnvironmentVariable("MAX_REQUESTS_PER_HOUR") ?? "10"),
+                maxEmailsPerDay: int.Parse(Environment.GetEnvironmentVariable("MAX_EMAILS_PER_DAY") ?? "20")))
     {
     }
 
     public Function(
         IAmazonSimpleEmailService sesClient,
         IFormDeserializer formDeserializer,
-        IEmailFormatter emailFormatter)
+        IEmailFormatter emailFormatter,
+        RateLimiter rateLimiter)
     {
         _sesClient = sesClient;
         _formDeserializer = formDeserializer;
         _emailFormatter = emailFormatter;
+        _rateLimiter = rateLimiter;
         _apiKey = Environment.GetEnvironmentVariable("API_KEY") ?? "";
         _verifiedSender = Environment.GetEnvironmentVariable("VERIFIED_SENDER_EMAIL") ?? "";
         var clientMappings = Environment.GetEnvironmentVariable("CLIENT_EMAIL_MAPPINGS");
@@ -126,7 +136,19 @@ public class Function
         try
         {
             context.Logger.LogInformation("Starting request validation");
-            
+
+            // Check IP rate limit
+            var clientIp = request.RequestContext?.Identity?.SourceIp ?? "unknown";
+            context.Logger.LogInformation($"Checking rate limit for IP: {clientIp}");
+
+            var ipAllowed = await _rateLimiter.CheckIpRateLimitAsync(clientIp);
+            if (!ipAllowed)
+            {
+                context.Logger.LogWarning($"Rate limit exceeded for IP: {clientIp}");
+                return CreateResponse(429, new { error = "Too many requests. Please try again later." }, headers);
+            }
+            context.Logger.LogInformation("IP rate limit check passed");
+
             // Validate API key
             context.Logger.LogInformation("Validating API key");
             if (!ValidateApiKey(request.Headers))
@@ -187,6 +209,16 @@ public class Function
                 context.Logger.LogWarning($"Unknown client ID: {body.ClientId}");
                 return CreateResponse(400, new { error = "Invalid client ID" }, headers);
             }
+
+            // Check email rate limit for this client
+            context.Logger.LogInformation($"Checking email rate limit for client: {body.ClientId}");
+            var emailAllowed = await _rateLimiter.CheckEmailRateLimitAsync(body.ClientId);
+            if (!emailAllowed)
+            {
+                context.Logger.LogWarning($"Email rate limit exceeded for client: {body.ClientId}");
+                return CreateResponse(429, new { error = "Daily email limit exceeded. Please try again tomorrow." }, headers);
+            }
+            context.Logger.LogInformation("Email rate limit check passed");
 
             // Send email
             context.Logger.LogInformation("Attempting to send email via SES");
