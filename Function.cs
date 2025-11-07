@@ -18,6 +18,7 @@ public class Function
     private readonly IFormDeserializer _formDeserializer;
     private readonly IEmailFormatter _emailFormatter;
     private readonly RateLimiter _rateLimiter;
+    private readonly SubmissionStore _submissionStore;
     private readonly Dictionary<string, string> _clientEmails;
     private readonly HashSet<string> _allowedOrigins;
     private readonly string _apiKey;
@@ -31,7 +32,8 @@ public class Function
             new RateLimiter(
                 Environment.GetEnvironmentVariable("RATE_LIMIT_TABLE") ?? "",
                 maxRequestsPerHour: int.Parse(Environment.GetEnvironmentVariable("MAX_REQUESTS_PER_HOUR") ?? "10"),
-                maxEmailsPerDay: int.Parse(Environment.GetEnvironmentVariable("MAX_EMAILS_PER_DAY") ?? "20")))
+                maxEmailsPerDay: int.Parse(Environment.GetEnvironmentVariable("MAX_EMAILS_PER_DAY") ?? "20")),
+            new SubmissionStore(Environment.GetEnvironmentVariable("SUBMISSION_STORE_TABLE") ?? ""))
     {
     }
 
@@ -39,12 +41,14 @@ public class Function
         IAmazonSimpleEmailService sesClient,
         IFormDeserializer formDeserializer,
         IEmailFormatter emailFormatter,
-        RateLimiter rateLimiter)
+        RateLimiter rateLimiter,
+        SubmissionStore submissionStore)
     {
         _sesClient = sesClient;
         _formDeserializer = formDeserializer;
         _emailFormatter = emailFormatter;
         _rateLimiter = rateLimiter;
+        _submissionStore = submissionStore;
         _apiKey = Environment.GetEnvironmentVariable("API_KEY") ?? "";
         _verifiedSender = Environment.GetEnvironmentVariable("VERIFIED_SENDER_EMAIL") ?? "";
         var clientMappings = Environment.GetEnvironmentVariable("CLIENT_EMAIL_MAPPINGS");
@@ -226,9 +230,17 @@ public class Function
 
             context.Logger.LogInformation($"Email sent successfully. MessageId: {messageId}");
 
-            return CreateResponse(200, new 
-            { 
-                success = true, 
+            // Store submission permanently for security and audit purposes
+            context.Logger.LogInformation("Storing submission data");
+            var submissionId = await _submissionStore.StoreSubmissionAsync(body, clientIp, messageId);
+            if (!string.IsNullOrEmpty(submissionId))
+            {
+                context.Logger.LogInformation($"Submission stored with ID: {submissionId}");
+            }
+
+            return CreateResponse(200, new
+            {
+                success = true,
                 message = "Email sent successfully",
                 messageId = messageId
             }, headers);
